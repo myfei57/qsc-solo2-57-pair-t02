@@ -195,6 +195,32 @@ class SecondaryLimits:
 
 
 @dataclass(frozen=True)
+class BalancingLimits:
+    """二次网配平：等温差法的死区、步幅、阀位限幅与守恒校验容差。"""
+
+    delta_t_deadband_c: float
+    max_step_pct: float
+    valve_min_pct: float
+    valve_max_pct: float
+    valve_gain: float
+    total_flow_rel_tol: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "BalancingLimits":
+        limits = cls(
+            delta_t_deadband_c=_number(section, "delta_t_deadband_c", minimum=0.0),
+            max_step_pct=_number(section, "max_step_pct", minimum=0.1),
+            valve_min_pct=_number(section, "valve_min_pct", minimum=0.0),
+            valve_max_pct=_number(section, "valve_max_pct", minimum=1.0),
+            valve_gain=_number(section, "valve_gain", minimum=0.1),
+            total_flow_rel_tol=_number(section, "total_flow_rel_tol", minimum=0.001),
+        )
+        if limits.valve_min_pct >= limits.valve_max_pct:
+            raise ConfigError("配平阀位下限必须小于上限", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class ValveLimits:
     """阀门行程速率与到位公差。"""
 
@@ -287,6 +313,7 @@ class PlatformConfig:
     station: StationLimits
     primary: PrimaryLimits
     secondary: SecondaryLimits
+    balancing: BalancingLimits
     valve: ValveLimits
     pump: PumpLimits
     pressure: PressureLimits
@@ -311,6 +338,7 @@ class PlatformConfig:
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
+            balancing=BalancingLimits.from_mapping(_section(limits, "balancing")),
             valve=ValveLimits.from_mapping(_section(limits, "valve")),
             pump=PumpLimits.from_mapping(_section(limits, "pump")),
             pressure=PressureLimits.from_mapping(_section(limits, "pressure")),
@@ -341,6 +369,7 @@ def default_config() -> PlatformConfig:
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
+        balancing=BalancingLimits(0.5, 10.0, 10.0, 90.0, 40.0, 0.02),
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
@@ -391,6 +420,14 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "valve": {
                 "travel_pct_s": cfg.valve.travel_pct_s,
                 "settle_band_pct": cfg.valve.settle_band_pct,
+            },
+            "balancing": {
+                "delta_t_deadband_c": cfg.balancing.delta_t_deadband_c,
+                "max_step_pct": cfg.balancing.max_step_pct,
+                "valve_min_pct": cfg.balancing.valve_min_pct,
+                "valve_max_pct": cfg.balancing.valve_max_pct,
+                "valve_gain": cfg.balancing.valve_gain,
+                "total_flow_rel_tol": cfg.balancing.total_flow_rel_tol,
             },
             "pump": {
                 "ramp_t_h_s": cfg.pump.ramp_t_h_s,

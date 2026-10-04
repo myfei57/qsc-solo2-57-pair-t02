@@ -13,6 +13,15 @@ import threading
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
+from .balancing import (
+    FAILURE_STATUSES,
+    StationReading,
+    compute_plan,
+    execute_plan,
+    verify_consistency,
+)
+from .balancing.execute import ExecutionReport
+from .balancing.model import BalancingPlan
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .errors import PlantError
@@ -55,6 +64,14 @@ from .valve.valve import Valve
 
 DEFAULT_UNIT = "heatnet"
 DEFAULT_ZONE = "north"
+
+
+def _optional_float(value: object) -> float | None:
+    """解析可缺省的数值回读；``None`` 表示回读缺失。"""
+
+    if value is None:
+        return None
+    return float(value)  # 非法取值抛 ValueError，由控制台转成 400
 
 # 分区布置：三个供热分区各自带若干换热站，拆分演示从 north 里划出一个新分区。
 _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
@@ -104,6 +121,10 @@ class Platform:
 
         self.stations, self.valves, self.queues = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
+        # 站序：距热源由近及远，按站名序登记（现场应按管线里程配置）。
+        self._station_orders = {
+            name: index + 1 for index, name in enumerate(sorted(self.stations))
+        }
         self.pump: Pump = self._build_pump()
 
         self.meters = QuotaAccumulator()
@@ -115,6 +136,8 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._balancing_runs = 0
+        self._last_balancing: dict = {}
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -193,6 +216,9 @@ class Platform:
             for command in self.queues[name].commands():
                 if command.seq <= applied:
                     continue
+        last_balancing = self.durable.load("balancing/last")
+        if last_balancing:
+            self._last_balancing = last_balancing
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -461,6 +487,142 @@ class Platform:
         with self._lock:
             target = self.pump.start(speed_pct)
             return {"running": self.pump.running(), "target_flow_t_h": round(target, 2)}
+
+    # ---- 二次网配平 ---------------------------------------------------
+
+    def _balancing_reading(self, item: dict) -> StationReading:
+        """把一路回读解析成配平输入；阀位以阀门当前位置为准。"""
+
+        name = str(item.get("station", ""))
+        if name not in self.stations:
+            raise PlantError(f"未登记换热站: {name}", component="balancing")
+        return StationReading(
+            station=name,
+            order=self._station_orders[name],
+            supply_c=_optional_float(item.get("supply_c")),
+            return_c=_optional_float(item.get("return_c")),
+            flow_t_h=_optional_float(item.get("flow_t_h")),
+            valve_pct=self.valves[name].position_pct(),
+            actuator=str(item.get("actuator") or self.valves[name].name),
+        )
+
+    def balance_secondary(self, readings: list[dict], operator: str = "console") -> dict:
+        """按各站回读做一轮等温差配平：方案 → 排序 → 逐台动阀 → 一致性核对。
+
+        方案先落盘、再动阀、执行结果再落盘，审计流水与控制台展示同源；回读
+        缺失的站按不动处理（部分失败），其余站继续。
+        """
+
+        with self._lock:
+            if not readings:
+                raise ValueError("配平回读不能为空")
+            names = [str(item.get("station", "")) for item in readings]
+            if len(names) != len(set(names)):
+                raise ValueError("配平回读存在重复站")
+            parsed = [self._balancing_reading(item) for item in readings]
+            op_id = self.ids.next()
+            plan = compute_plan(parsed, self.config.balancing, op_id, self.clock.now())
+            self.durable.save("balancing/plan", plan.as_dict())
+            execution = execute_plan(plan, self.valves, self.durable)
+            problems = verify_consistency(plan, execution)
+            report = {
+                "op_id": op_id,
+                "plan_id": plan.plan_id,
+                "method": plan.method,
+                "status": plan.status,
+                "ok": plan.ok() and execution.ok(),
+                "partial": plan.partial() or not execution.ok(),
+                "consistent": not problems,
+                "problems": problems,
+                "target_delta_c": round(plan.target_delta_c, 2),
+                "total_flow_before_t_h": round(plan.total_flow_before_t_h, 2),
+                "total_flow_after_t_h": round(plan.total_flow_after_t_h, 2),
+                "actions": len(plan.actions),
+                "skipped": len(plan.skipped),
+                "stations": plan.rows(),
+                "execution": execution.as_dict()["actions"],
+                "operator": operator,
+            }
+            self.durable.save("balancing/last", report)
+            self._last_balancing = report
+            self._balancing_runs += 1
+            self._record_balancing(plan, execution, report)
+            self._operations += 1
+            self._persist()
+            return report
+
+    def _record_balancing(
+        self, plan: BalancingPlan, execution: ExecutionReport, report: dict
+    ) -> None:
+        """把配平方案与执行结果写进审计流水（与控制台展示同源）。"""
+
+        self.bus.publish(
+            Event.of(
+                "balancing",
+                "balancing",
+                "plan",
+                severity="warning" if plan.partial() else "notice",
+                message=f"配平方案 {plan.plan_id}（{plan.status}）",
+                asset="secondary",
+                plan_id=plan.plan_id,
+                method=plan.method,
+                status=plan.status,
+                target_delta_c=round(plan.target_delta_c, 2),
+                total_flow_before_t_h=round(plan.total_flow_before_t_h, 2),
+                total_flow_after_t_h=round(plan.total_flow_after_t_h, 2),
+                stations=plan.rows(),
+            )
+        )
+        for skipped in plan.skipped:
+            self.bus.publish(
+                Event.of(
+                    "balancing",
+                    "balancing",
+                    "station_skipped",
+                    severity="warning" if skipped.status in FAILURE_STATUSES else "notice",
+                    message=f"{skipped.station} 不动作：{skipped.reason}",
+                    asset=skipped.station,
+                    plan_id=plan.plan_id,
+                    station=skipped.station,
+                    status=skipped.status.value,
+                    reason=skipped.reason,
+                )
+            )
+        for done in execution.actions:
+            self.bus.publish(
+                Event.of(
+                    "balancing",
+                    "balancing",
+                    "valve_move",
+                    severity="notice" if done.result == "DONE" else "warning",
+                    message=f"{done.station} 阀位 → {done.actual_valve_pct:.1f}%",
+                    asset=done.station,
+                    plan_id=plan.plan_id,
+                    **done.as_dict(),
+                )
+            )
+        complete = report["ok"] and not report["partial"]
+        self.bus.publish(
+            Event.of(
+                "balancing",
+                "balancing",
+                "balance_complete" if complete else "balance_partial",
+                severity="notice" if complete else "warning",
+                message="配平完成" if complete else "配平部分完成",
+                asset="secondary",
+                plan_id=plan.plan_id,
+                consistent=report["consistent"],
+                problems=list(report["problems"]),
+                actions=report["actions"],
+                skipped=report["skipped"],
+            )
+        )
+
+    def balancing_report(self) -> dict:
+        """返回最近一次配平方案与执行结果，供控制台展示。"""
+
+        with self._lock:
+            return {"runs": self._balancing_runs, "plan": self._last_balancing or None}
 
     def stop_pump(self) -> dict:
         """停循环泵。"""
@@ -792,6 +954,10 @@ class Platform:
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),
             },
             "secondary": self.secondary.snapshot().as_dict(),
+            "balancing": {
+                "runs": self._balancing_runs,
+                "last_plan_id": (self._last_balancing or {}).get("plan_id"),
+            },
             "pressure": self.pressure_report(),
             "pump": {**self.pump.snapshot().as_dict(), "curve": self.pump.curve.describe()},
             "stations": {

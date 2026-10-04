@@ -4,8 +4,9 @@
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
-            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 二次网配平 →
+            热量采集与结算 → 分区拆分 → 阀门队列回放 → 停机与复位），
+            用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -43,6 +44,30 @@ def _build(args: argparse.Namespace) -> Platform:
 
 def _dump(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def _demo_balancing_readings(platform: Platform) -> list[dict]:
+    """构造演示回读：近端贪水、远端欠水，中间一站回读缺失（部分失败）。"""
+
+    profiles = {
+        "st01": (57.0, 150.0),
+        "st02": (54.0, 120.0),
+        "st03": (51.0, 100.0),
+        "st04": None,
+        "st05": (45.0, 65.0),
+        "st06": (42.0, 50.0),
+    }
+    readings = []
+    for name in sorted(platform.stations):
+        profile = profiles.get(name)
+        entry: dict = {"station": name, "supply_c": 68.0}
+        if profile is None:
+            entry["return_c"] = None
+            entry["flow_t_h"] = None
+        else:
+            entry["return_c"], entry["flow_t_h"] = profile
+        readings.append(entry)
+    return readings
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -89,6 +114,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     calibration = platform.calibrate_flow(args.baseline_t_h)
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
+    balance = platform.balance_secondary(_demo_balancing_readings(platform), "demo-operator")
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
     settled = platform.settle_quota()
     split = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
@@ -119,6 +145,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "calibration": calibration,
         "retrofit": retrofit,
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
+        "balance": {
+            key: balance[key]
+            for key in ("plan_id", "status", "ok", "partial", "consistent", "actions", "skipped")
+        },
         "heat": heat,
         "settled": settled,
         "split": split,
@@ -134,6 +164,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     _dump(report)
 
     failures = [name for name, item in probe.items() if not item["ok"]]
+    if not balance["consistent"]:
+        failures.append("balance:inconsistent")
+    if balance["actions"] < 1:
+        failures.append("balance:no-actions")
     for name, operation in (
         ("weather", weather),
         ("launch", launch),

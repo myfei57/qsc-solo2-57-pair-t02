@@ -48,6 +48,7 @@ class Api:
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
+        add("GET", "/api/balancing", lambda params, body: self._platform.balancing_report())
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
         add("GET", "/api/trend", self._trend)
@@ -67,6 +68,7 @@ class Api:
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/retrofit", self._retrofit)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
+        add("POST", "/api/balancing", self._balancing)
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
@@ -296,6 +298,12 @@ class Api:
 
     def _secondary_cycle(self, params: dict, body: dict) -> dict:
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
+
+    def _balancing(self, params: dict, body: dict) -> dict:
+        readings = body.get("readings")
+        if not isinstance(readings, list) or not readings:
+            raise ValueError("请求体必须包含非空 readings 列表")
+        return self._platform.balance_secondary(readings, str(body.get("operator", "console")))
 
     def _meter(self, params: dict, body: dict) -> dict:
         return self._platform.collect_heat(

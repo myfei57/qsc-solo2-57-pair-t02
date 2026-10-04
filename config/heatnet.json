@@ -42,6 +42,14 @@
       "travel_pct_s": 12.0,
       "settle_band_pct": 1.5
     },
+    "balancing": {
+      "delta_t_deadband_c": 0.5,
+      "max_step_pct": 10.0,
+      "valve_min_pct": 10.0,
+      "valve_max_pct": 90.0,
+      "valve_gain": 40.0,
+      "total_flow_rel_tol": 0.02
+    },
     "pump": {
       "ramp_t_h_s": 40.0,
       "min_speed_pct": 20.0,
