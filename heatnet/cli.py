@@ -175,6 +175,51 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_trim(args: argparse.Namespace) -> int:
+    """按内置投运回读演示二次侧配平：方案、执行与逐站偏差。"""
+
+    platform = _build(args)
+    plan = platform.trim_plan()
+    run = platform.trim_run(readback_fail=list(args.readback_fail))
+    if args.table:
+        _print_trim_table(plan, run)
+        return 0
+    payload = {"plan": plan, "run": run}
+    _dump(payload)
+    return 0 if run["reconciled"] else 1
+
+
+def _print_trim_table(plan: dict, run: dict) -> None:
+    actual = {row["station"]: row for row in run["results"]}
+    print(f"配平方法 {plan['method']}　保端策略 {plan['priority']}　方案指纹 {plan['fingerprint']}")
+    print(f"目标温差 {plan['target_delta_c']} ℃　参与站 {plan['participant_count']}　缺测站 {plan['missing_stations']}")
+    header = ("站序", "站", "状态", "现流量", "目标流量", "流量偏差", "温差偏差", "现阀位", "目标阀位", "阀位偏差", "实际阀位", "回读偏差")
+    print("　".join(f"{item:>8}" for item in header))
+    for row in plan["rows"]:
+        item = actual.get(row["station"], {})
+        dev = next((line for line in run["deviations"] if line["station"] == row["station"]), {})
+        values = (
+            row["order"],
+            row["station"],
+            item.get("status", row["status"]),
+            _cell(row["flow_t_h"]),
+            _cell(row["target_flow_t_h"]),
+            _cell(dev.get("flow_error_t_h")),
+            _cell(dev.get("delta_c_error")),
+            _cell(row["valve_pct"]),
+            _cell(row["target_valve_pct"]),
+            _cell(dev.get("valve_error_pct")),
+            _cell(item.get("actual_valve_pct")),
+            _cell(dev.get("readback_error_pct")),
+        )
+        print("　".join(f"{str(value):>8}" for value in values))
+    print(f"执行状态 {run['status']}　对账 {'一致' if run['reconciled'] else '不一致'}　动作 {run['acted_count']} 站　回读缺失 {run['readback_missing_stations']}")
+
+
+def _cell(value) -> str:
+    return "-" if value is None else str(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -213,6 +258,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    trim = sub.add_parser("trim", help="二次侧配平：算方案并按远端优先串行执行", parents=[common])
+    trim.add_argument("--table", action="store_true", help="打印值班员用的逐站偏差表")
+    trim.add_argument(
+        "--readback-fail",
+        nargs="*",
+        default=["st02"],
+        help="注入回读缺失的站（默认 st02，演示部分失败：该站不动、其余继续）",
+    )
+    trim.set_defaults(func=_cmd_trim)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

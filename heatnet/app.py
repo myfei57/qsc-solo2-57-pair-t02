@@ -33,6 +33,9 @@ from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
+from .secondary.trim import METHOD_EQUAL_DELTA_T, PRIORITY_FAR_FIRST
+from .secondary.actuator import SimulatedTrimDriver
+from .secondary.trim_service import TrimService
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
 from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
@@ -65,6 +68,19 @@ _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 
 # 热量表按站登记，回绕阈值取配置值。
 _METER_SUFFIX = ".heat-meter"
+
+# 二次侧配平演示回读：站序按离热源由近到远（st01 近端、st06 远端）。投运后
+# 近端温差小、回水偏暖（贪水），远端温差大、回水偏冷（不够）；st03 回水
+# 温度变送器故障，演示"回读缺失不进配平、其余站继续"。
+TRIM_DEMO_SUPPLY_C = 65.0
+_TRIM_DEMO_READINGS: tuple[dict, ...] = (
+    {"station": "st01", "supply_c": 65.0, "return_c": 50.0, "flow_t_h": 300.0, "valve_pct": 80.0},
+    {"station": "st02", "supply_c": 65.0, "return_c": 48.0, "flow_t_h": 260.0, "valve_pct": 70.0},
+    {"station": "st03", "supply_c": 65.0, "return_c": None, "flow_t_h": 220.0, "valve_pct": 60.0},
+    {"station": "st04", "supply_c": 65.0, "return_c": 44.0, "flow_t_h": 210.0, "valve_pct": 55.0},
+    {"station": "st05", "supply_c": 65.0, "return_c": 42.0, "flow_t_h": 180.0, "valve_pct": 45.0},
+    {"station": "st06", "supply_c": 65.0, "return_c": 40.0, "flow_t_h": 150.0, "valve_pct": 35.0},
+)
 
 
 class Platform:
@@ -104,6 +120,8 @@ class Platform:
 
         self.stations, self.valves, self.queues = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
+        self.trim_driver = self._build_trim_driver()
+        self.trim = TrimService(store, self.trim_driver, bus=self.bus)
         self.pump: Pump = self._build_pump()
 
         self.meters = QuotaAccumulator()
@@ -142,6 +160,14 @@ class Platform:
                 valves[name] = Valve(f"{name}.mix", self.config.valve)
                 queues[name] = ValveCommandQueue(name)
         return stations, valves, queues
+
+    def _build_trim_driver(self) -> SimulatedTrimDriver:
+        """构造二次侧配平阀模拟驱动，当前阀位取演示回读。"""
+
+        driver = SimulatedTrimDriver()
+        for reading in _TRIM_DEMO_READINGS:
+            driver.seed(str(reading["station"]), float(reading["valve_pct"]))
+        return driver
 
     def _build_pump(self) -> Pump:
         """按一次网基线构造循环泵特性。"""
@@ -524,6 +550,36 @@ class Platform:
                 "index": self.mapping.describe()["index"],
             }
 
+    def trim_plan(self, readings: list[dict] | None = None) -> dict:
+        """生成二次侧配平方案（等温差＋保远端优先），只落盘展示、不动阀。"""
+
+        with self._lock:
+            return self.trim.plan(self._trim_readings(readings))
+
+    def trim_run(self, readings: list[dict] | None = None, readback_fail: list[str] | None = None) -> dict:
+        """执行一轮二次侧配平：远端优先串行动阀，回读缺失站按不动继续。"""
+
+        with self._lock:
+            for station in readback_fail or []:
+                self.trim_driver.fail_readback(str(station))
+            return self.trim.execute(self._trim_readings(readings))
+
+    def trim_clear_fault(self, station: str) -> dict:
+        """现场消缺后解除某站配平阀的回读缺失，下一轮配平即可正常动作。"""
+
+        with self._lock:
+            self.trim_driver.clear_fault(str(station))
+            return {"station": str(station), "readback_fault": False}
+
+    @staticmethod
+    def trim_demo_readings() -> list[dict]:
+        """返回内置的投运后配平演示回读（近→远站序，st03 回读缺失）。"""
+
+        return [dict(item) for item in _TRIM_DEMO_READINGS]
+
+    def _trim_readings(self, readings: list[dict] | None) -> list[dict]:
+        return self.trim_demo_readings() if readings is None else [dict(item) for item in readings]
+
     def replay_valves(self, stations: list[str] | None = None) -> dict:
         """按检查点回放阀门指令队列。"""
 
@@ -792,6 +848,12 @@ class Platform:
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),
             },
             "secondary": self.secondary.snapshot().as_dict(),
+            "trim": {
+                "method": METHOD_EQUAL_DELTA_T,
+                "priority": PRIORITY_FAR_FIRST,
+                "planned": self.audit.count("trim_planned"),
+                "executed": self.audit.count("trim_executed"),
+            },
             "pressure": self.pressure_report(),
             "pump": {**self.pump.snapshot().as_dict(), "curve": self.pump.curve.describe()},
             "stations": {

@@ -71,6 +71,9 @@ class Api:
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
+        add("POST", "/api/trim/plan", self._trim_plan)
+        add("POST", "/api/trim/run", self._trim_run)
+        add("POST", "/api/trim/clear-fault", self._trim_clear_fault)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/trip", self._trip)
@@ -326,6 +329,26 @@ class Api:
         if action == "stop":
             return self._platform.stop_pump()
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
+
+    def _trim_readings(self, body: dict):
+        readings = body.get("readings")
+        if readings is None:
+            return None
+        if not isinstance(readings, list):
+            raise PlantError("readings 必须是按近→远站序的列表", component="console")
+        return readings
+
+    def _trim_plan(self, params: dict, body: dict) -> dict:
+        return self._platform.trim_plan(self._trim_readings(body))
+
+    def _trim_run(self, params: dict, body: dict) -> dict:
+        fail = body.get("readback_fail") or []
+        if not isinstance(fail, list):
+            raise PlantError("readback_fail 必须是站名列表", component="console")
+        return self._platform.trim_run(self._trim_readings(body), [str(item) for item in fail])
+
+    def _trim_clear_fault(self, params: dict, body: dict) -> dict:
+        return self._platform.trim_clear_fault(str(body.get("station", "")))
 
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_secondary(_as_float(body, "heat_fraction", 0.5))
